@@ -16,3 +16,5 @@ venv/
 dist/
 .pytest_cache/
 .tmp/
+AGENTS.md
+docs/
