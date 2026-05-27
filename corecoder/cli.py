@@ -15,6 +15,8 @@ from .agent import Agent
 from .llm import LLM, LiteLLM
 from .config import Config
 from .session import save_session, load_session, list_sessions
+from .planner import PlanError, Planner
+from .tasks import TaskState
 from . import __version__
 
 console = Console()
@@ -92,7 +94,7 @@ def main():
         return
 
     # interactive REPL
-    _repl(agent, config)
+    _repl(agent, config, Planner(session_id=args.resume or "default"))
 
 
 def _run_once(agent: Agent, prompt: str):
@@ -107,8 +109,9 @@ def _run_once(agent: Agent, prompt: str):
     print()
 
 
-def _repl(agent: Agent, config: Config):
+def _repl(agent: Agent, config: Config, planner: Planner | None = None):
     """Interactive read-eval-print loop."""
+    planner = planner or Planner()
     console.print(Panel(
         f"[bold]CoreCoder[/bold] v{__version__}\n"
         f"Model: [cyan]{config.model}[/cyan]"
@@ -152,6 +155,23 @@ def _repl(agent: Agent, config: Config):
             break
         if user_input == "/help":
             _show_help()
+            continue
+        if user_input == "/plan_mode":
+            planner.enable_plan_mode()
+            console.print("[cyan]Plan mode enabled for the next request.[/cyan]")
+            continue
+        if user_input == "/task":
+            task = planner.active_task()
+            if task is None:
+                console.print("[dim]No active task.[/dim]")
+            else:
+                console.print(_format_task_summary(task), markup=False)
+            continue
+        if user_input == "/tasks":
+            console.print(
+                _format_tasks_summary(planner.store.list_tasks()),
+                markup=False,
+            )
             continue
         if user_input == "/reset":
             agent.reset()
@@ -208,6 +228,35 @@ def _repl(agent: Agent, config: Config):
                     console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
             continue
 
+        if planner.plan_mode_enabled:
+            try:
+                task = planner.generate_plan(
+                    llm=agent.llm,
+                    user_goal=user_input,
+                    model=config.model,
+                    cwd=os.getcwd(),
+                )
+            except PlanError as e:
+                console.print(f"[red]Plan failed: {e}[/red]")
+                continue
+
+            console.print(_format_plan_approval(task), markup=False)
+            choice = pt_prompt("Plan choice [approve/reject/revise] > ").strip().lower()
+            if choice in {"approve", "a", "yes", "y"}:
+                task = planner.approve_plan(task.id)
+                console.print(f"[green]Plan approved: {task.id}[/green]")
+            elif choice in {"reject", "r", "no", "n"}:
+                reason = pt_prompt("Reject reason > ").strip()
+                task = planner.reject_plan(task.id, reason=reason)
+                console.print(f"[yellow]Plan rejected: {task.id}[/yellow]")
+                continue
+            elif choice in {"revise", "v"}:
+                console.print("[yellow]Plan mode stays enabled for revision.[/yellow]")
+                continue
+            else:
+                console.print("[yellow]Unknown choice; plan mode stays enabled.[/yellow]")
+                continue
+
         # call the agent
         streamed: list[str] = []
 
@@ -251,6 +300,38 @@ def _show_help():
         title="CoreCoder Help",
         border_style="dim",
     ))
+
+
+def _format_plan_approval(task: TaskState) -> str:
+    lines = [f"Plan generated for task {task.id}", ""]
+    for index, step in enumerate(task.steps, start=1):
+        lines.append(f"{index}. {step.title}")
+        if step.acceptance:
+            lines.append(f"   Verify: {step.acceptance}")
+    lines.extend(["", "[Approve]  [Reject]  [Revise]"])
+    return "\n".join(lines)
+
+
+def _format_task_summary(task: TaskState) -> str:
+    lines = [f"Task {task.id}", f"Status: {task.status}", f"Goal: {task.user_goal}"]
+    if task.current_step:
+        lines.append(f"Current step: {task.current_step}")
+    if task.steps:
+        lines.append("Steps:")
+        for step in task.steps:
+            lines.append(f"- {step.id} [{step.status}] {step.title}")
+    if task.last_error:
+        lines.append(f"Last error: {task.last_error}")
+    return "\n".join(lines)
+
+
+def _format_tasks_summary(tasks: list[TaskState]) -> str:
+    if not tasks:
+        return "No tasks."
+    lines = []
+    for task in tasks:
+        lines.append(f"{task.id}  {task.status}  {task.user_goal}")
+    return "\n".join(lines)
 
 
 def _brief(kwargs: dict, maxlen: int = 80) -> str:

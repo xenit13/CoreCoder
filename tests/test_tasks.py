@@ -40,6 +40,7 @@ def test_task_can_be_created_updated_and_reloaded(monkeypatch, tmp_path):
     assert (root / task.id).resolve().is_relative_to(root.resolve())
 
     store.update_step(task.id, "S1", "completed", notes="covered by tests")
+    store.update_status(task.id, "awaiting_approval")
     store.update_status(task.id, "running", current_step="S2")
 
     reloaded = TaskStore().load(task.id)
@@ -125,6 +126,7 @@ def test_checkpoint_can_be_saved_and_reloaded(monkeypatch, tmp_path):
         task_id="checkpoint-task",
         steps=[TaskStep(id="S1", title="Create checkpoint", acceptance="Reload succeeds.")],
     )
+    store.update_status(task.id, "awaiting_approval")
     store.update_status(task.id, "running", current_step="S1")
     task = store.load(task.id)
     assert task is not None

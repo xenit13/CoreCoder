@@ -11,7 +11,7 @@ which means it's done working and ready to report back.
 
 import concurrent.futures
 from .llm import LLM
-from .tools import ALL_TOOLS, get_tool
+from .tools import ALL_TOOLS
 from .tools.base import Tool
 from .tools.agent import AgentTool
 from .prompt import system_prompt
@@ -25,13 +25,14 @@ class Agent:
         tools: list[Tool] | None = None,
         max_context_tokens: int = 128_000,
         max_rounds: int = 50,
+        system: str | None = None,
     ):
         self.llm = llm
         self.tools = tools if tools is not None else ALL_TOOLS
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
         self.max_rounds = max_rounds
-        self._system = system_prompt(self.tools)
+        self._system = system or system_prompt(self.tools)
 
         # wire up sub-agent capability
         for t in self.tools:
@@ -92,7 +93,7 @@ class Agent:
 
     def _exec_tool(self, tc) -> str:
         """Execute a single tool call, returning the result string."""
-        tool = get_tool(tc.name)
+        tool = next((tool for tool in self.tools if tool.name == tc.name), None)
         if tool is None:
             return f"Error: unknown tool '{tc.name}'"
         try:

@@ -37,6 +37,17 @@ DEFAULT_BUDGETS = {
     "subagent_foreground_seconds": 60,
 }
 
+ALLOWED_TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    "draft": {"awaiting_approval", "cancelled"},
+    "awaiting_approval": {"running", "cancelled"},
+    "running": {"paused", "blocked", "completed", "failed", "cancelled"},
+    "paused": {"running", "cancelled"},
+    "blocked": {"awaiting_approval", "failed", "cancelled"},
+    "completed": set(),
+    "failed": set(),
+    "cancelled": set(),
+}
+
 
 _SAFE_TASK_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _UNSET = object()
@@ -168,6 +179,23 @@ class TaskStore:
             return None
         return TaskState.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
+    def list_tasks(self) -> list[TaskState]:
+        if not self.root.exists():
+            return []
+        paths = sorted(
+            self.root.glob("*/task.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        tasks = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tasks.append(TaskState.from_dict(data))
+            except (OSError, KeyError, TypeError, json.JSONDecodeError, TaskStatusError):
+                continue
+        return tasks
+
     def save(self, task: TaskState) -> None:
         path = self.task_path(task.id)
         _write_json_atomic(path, task.to_dict())
@@ -181,7 +209,9 @@ class TaskStore:
         last_error: str | None | object = _UNSET,
     ) -> TaskState:
         task = self._require_task(task_id)
-        task.status = _validate_task_status(status)
+        next_status = _validate_task_status(status)
+        _validate_task_transition(task.status, next_status)
+        task.status = next_status
         task.updated_at = _now()
         if current_step is not _UNSET:
             task.current_step = current_step
@@ -245,6 +275,16 @@ def _validate_task_status(status: str) -> TaskStatus:
     if status not in get_args(TaskStatus):
         raise TaskStatusError(f"Invalid task status: {status}")
     return cast(TaskStatus, status)
+
+
+def _validate_task_transition(current: TaskStatus, next_status: TaskStatus) -> None:
+    if current == next_status:
+        return
+    allowed = ALLOWED_TASK_TRANSITIONS[current]
+    if next_status not in allowed:
+        raise TaskStatusError(
+            f"Invalid task status transition: {current} -> {next_status}"
+        )
 
 
 def _validate_step_status(status: str) -> StepStatus:
