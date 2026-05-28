@@ -199,13 +199,29 @@ def _repl(
             if task is None:
                 console.print("[dim]No active task.[/dim]")
             else:
-                console.print(_format_task_summary(task), markup=False)
+                runner.reconcile_background(task.id)
+                task = planner.store.load(task.id) or task
+                console.print(
+                    _format_task_summary(task, runner.background_handles(task.id)),
+                    markup=False,
+                )
             continue
         if user_input == "/tasks":
             console.print(
                 _format_tasks_summary(planner.store.list_tasks()),
                 markup=False,
             )
+            continue
+        if user_input == "/logs" or user_input.startswith("/logs "):
+            task = planner.active_task()
+            if task is None:
+                console.print("[dim]No active task.[/dim]")
+                continue
+            agent_id = user_input[6:].strip() or None
+            try:
+                console.print(runner.background_logs(task.id, agent_id), markup=False)
+            except KeyError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
             continue
         if user_input == "/reset":
             agent.reset()
@@ -459,7 +475,10 @@ def _format_plan_approval(task: TaskState) -> str:
     return "\n".join(lines)
 
 
-def _format_task_summary(task: TaskState) -> str:
+def _format_task_summary(
+    task: TaskState,
+    background_handles: list[dict] | None = None,
+) -> str:
     lines = [f"Task {task.id}", f"Status: {task.status}", f"Goal: {task.user_goal}"]
     if task.current_step:
         lines.append(f"Current step: {task.current_step}")
@@ -467,9 +486,23 @@ def _format_task_summary(task: TaskState) -> str:
         lines.append("Steps:")
         for step in task.steps:
             lines.append(f"- {step.id} [{step.status}] {step.title}")
+    if background_handles:
+        lines.append("Background agents:")
+        for handle in background_handles:
+            lines.append(
+                f"- {handle['id']} [{_format_background_status(handle)}] "
+                f"transcript={handle['transcript_path']} result={handle['result_path']}"
+            )
     if task.last_error:
         lines.append(f"Last error: {task.last_error}")
     return "\n".join(lines)
+
+
+def _format_background_status(handle: dict) -> str:
+    status = handle.get("status", "unknown")
+    if status in {"completed", "failed"} and not handle.get("reconciled"):
+        return f"{status} pending reconciliation"
+    return status
 
 
 def _format_tasks_summary(tasks: list[TaskState]) -> str:

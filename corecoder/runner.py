@@ -3,10 +3,12 @@
 import time
 from typing import Any
 
+from .background import BackgroundRegistry
 from .checkpoint import Checkpoint, CheckpointStore
 from .events import EventLog
 from .plan_files import plan_file_path
 from .tasks import TASKS_DIR, TaskState, TaskStatusError, TaskStore
+from .tools.agent import AgentTool
 from .tools.progress import TaskProgressTool
 
 
@@ -45,6 +47,8 @@ class TaskRunner:
         counters = {"rounds": 0, "tool_calls": 0}
         started_at = time.monotonic()
         last_progress_round = 0
+        background_registry = BackgroundRegistry(task.id, self.store.root)
+        self._append_background_notifications(task.id, background_registry)
 
         def record_progress() -> None:
             nonlocal last_progress_round
@@ -69,6 +73,10 @@ class TaskRunner:
             events=events,
             checkpoint_callback=lambda: self._save_checkpoint(task.id, counters, events),
             progress_callback=record_progress,
+        )
+        background_state = self._install_background_registry(
+            background_registry,
+            task.budgets.get("subagent_foreground_seconds", 60),
         )
         original_tools = self._install_progress_tool(progress_tool)
         try:
@@ -95,11 +103,15 @@ class TaskRunner:
             raise
         finally:
             self._restore_tools(original_tools)
+            self._restore_background_registry(background_state)
 
     def restore_from_checkpoint(self, task_id: str) -> Checkpoint | None:
         checkpoint = self.checkpoints.load(task_id)
         if checkpoint is not None:
             self.agent.messages = list(checkpoint.messages)
+            registry = BackgroundRegistry(task_id, self.store.root)
+            registry.mark_interrupted()
+            self._append_background_notifications(task_id, registry)
         return checkpoint
 
     def restore_latest_for_session(self, session_id: str) -> Checkpoint | None:
@@ -131,6 +143,18 @@ class TaskRunner:
             events,
             reason=reason,
         )
+
+    def reconcile_background(self, task_id: str) -> list[str]:
+        return self._append_background_notifications(
+            task_id,
+            BackgroundRegistry(task_id, self.store.root),
+        )
+
+    def background_handles(self, task_id: str) -> list[dict[str, Any]]:
+        return BackgroundRegistry(task_id, self.store.root).list_handles()
+
+    def background_logs(self, task_id: str, agent_id: str | None = None) -> str:
+        return BackgroundRegistry(task_id, self.store.root).read_logs(agent_id)
 
     def _prepare_running_task(self, task_id: str) -> TaskState:
         task = self.store.load(task_id)
@@ -174,6 +198,9 @@ class TaskRunner:
                 self._block_task(task.id, reason, counters, events)
             else:
                 self._save_checkpoint(task.id, counters, events)
+            return response
+        if BackgroundRegistry(task.id, self.store.root).has_active_or_unreconciled():
+            self._save_checkpoint(task.id, counters, events)
             return response
         if task.steps and all(step.status in {"completed", "skipped"} for step in task.steps):
             task = self.store.update_status(
@@ -242,6 +269,7 @@ class TaskRunner:
         if task.status in {"completed", "failed"}:
             raise TaskStatusError(f"Terminal task cannot be cancelled: {task.status}")
         task = self.store.update_status(task_id, "cancelled", last_error=reason)
+        BackgroundRegistry(task.id, self.store.root).cancel_all(reason=reason)
         events.append("task_cancelled", task_id=task.id, reason=reason)
         self._save_checkpoint(task.id, counters, events)
         return task
@@ -306,6 +334,7 @@ class TaskRunner:
             messages=list(getattr(self.agent, "messages", [])),
             tool_counters=dict(counters),
             changed_files=_changed_files(),
+            background_subagents=BackgroundRegistry(task.id, self.store.root).list_handles(),
             last_event_offset=len(events.read()),
         )
         events.append("checkpoint_saved", task_id=task.id)
@@ -327,6 +356,36 @@ class TaskRunner:
             "</system-reminder>",
         ]
         self.agent.messages.append({"role": "user", "content": "\n".join(lines)})
+
+    def _append_background_notifications(
+        self,
+        task_id: str,
+        registry: BackgroundRegistry,
+    ) -> list[str]:
+        if not hasattr(self.agent, "messages"):
+            return []
+        notifications = registry.reconcile_completed()
+        for notification in notifications:
+            self.agent.messages.append({"role": "user", "content": notification})
+        return notifications
+
+    def _install_background_registry(
+        self,
+        registry: BackgroundRegistry,
+        foreground_seconds: int | float,
+    ):
+        if not hasattr(self.agent, "tools"):
+            return []
+        states = []
+        for tool in self.agent.tools:
+            if isinstance(tool, AgentTool):
+                states.append((tool, tool._background_registry, tool._background_foreground_seconds))
+                tool.configure_background(registry, foreground_seconds)
+        return states
+
+    def _restore_background_registry(self, states) -> None:
+        for tool, registry, foreground_seconds in states:
+            tool.configure_background(registry, foreground_seconds)
 
     def _install_progress_tool(self, progress_tool: TaskProgressTool):
         if not hasattr(self.agent, "tools"):
