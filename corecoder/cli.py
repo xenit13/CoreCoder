@@ -98,10 +98,7 @@ def main():
                 agent.llm.model = loaded_model
                 config.model = loaded_model
             console.print(f"[green]Resumed session: {args.resume} (model: {agent.llm.model})[/green]")
-            checkpoint = runner.restore_latest_for_session(args.resume)
-            if checkpoint is not None:
-                planner.active_task_id = checkpoint.task_id
-                console.print(f"[green]Restored task checkpoint: {checkpoint.task_id}[/green]")
+            _restore_task_for_resumed_session(planner, runner, args.resume)
         else:
             console.print(f"[red]Session '{args.resume}' not found.[/red]")
             sys.exit(1)
@@ -113,6 +110,18 @@ def main():
 
     # interactive REPL
     _repl(agent, config, planner, runner)
+
+
+def _restore_task_for_resumed_session(
+    planner: Planner,
+    runner: TaskRunner,
+    session_id: str,
+):
+    checkpoint = runner.restore_latest_for_session(session_id)
+    if checkpoint is not None:
+        planner.active_task_id = checkpoint.task_id
+        console.print(f"[green]Restored task checkpoint: {checkpoint.task_id}[/green]")
+    return checkpoint
 
 
 def _run_once(agent: Agent, prompt: str):
