@@ -15,7 +15,7 @@ from .agent import Agent
 from .llm import LLM, LiteLLM
 from .config import Config
 from .session import save_session, load_session, list_sessions
-from .planner import PlanError, Planner
+from .planner import PlanError, Planner, build_approved_plan_context
 from .tasks import TaskState
 from . import __version__
 
@@ -228,6 +228,8 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
                     console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
             continue
 
+        execution_input = user_input
+
         if planner.plan_mode_enabled:
             try:
                 task = planner.generate_plan(
@@ -244,6 +246,7 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
             choice = pt_prompt("Plan choice [approve/reject/revise] > ").strip().lower()
             if choice in {"approve", "a", "yes", "y"}:
                 task = planner.approve_plan(task.id)
+                execution_input = build_approved_plan_context(task, user_input)
                 console.print(f"[green]Plan approved: {task.id}[/green]")
             elif choice in {"reject", "r", "no", "n"}:
                 reason = pt_prompt("Reject reason > ").strip()
@@ -268,7 +271,7 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
             console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
 
         try:
-            response = agent.chat(user_input, on_token=on_token, on_tool=on_tool)
+            response = agent.chat(execution_input, on_token=on_token, on_tool=on_tool)
             if streamed:
                 print()  # newline after streamed tokens
             else:

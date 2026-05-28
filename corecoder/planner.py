@@ -120,6 +120,31 @@ def _read_only_plan_tools():
     return [GlobTool(), GrepTool(), ReadFileTool()]
 
 
+def build_approved_plan_context(task: TaskState, user_input: str) -> str:
+    lines = [
+        "Approved plan is ready for foreground execution.",
+        "",
+        "Original request:",
+        user_input,
+        "",
+        f"Approved plan for task {task.id}:",
+    ]
+    for index, step in enumerate(task.steps, start=1):
+        lines.append(f"{index}. {step.title}")
+        if step.acceptance:
+            lines.append(f"   Acceptance: {step.acceptance}")
+        if step.depends_on:
+            lines.append(f"   Depends on: {', '.join(step.depends_on)}")
+    lines.extend(
+        [
+            "",
+            "Use this approved plan as execution context.",
+            "Continue in the normal foreground agent loop and use the plan to guide the work.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _plan_system_prompt() -> str:
     return """\
 You are CoreCoder planning mode. Do not edit files, run shell commands, change

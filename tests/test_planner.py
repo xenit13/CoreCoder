@@ -2,11 +2,13 @@ import json
 from pathlib import Path
 
 from corecoder.agent import Agent
+from corecoder import cli as cli_module
 from corecoder import checkpoint as checkpoint_module
 from corecoder import events as events_module
 from corecoder import planner as planner_module
 from corecoder import tasks as tasks_module
-from corecoder.cli import _format_plan_approval, _format_task_summary
+from corecoder.cli import _format_plan_approval, _format_task_summary, _repl
+from corecoder.config import Config
 from corecoder.events import EventLog
 from corecoder.llm import LLMResponse, ToolCall
 from corecoder.planner import Planner
@@ -176,3 +178,33 @@ def test_cli_formats_active_task_and_plan_choices(monkeypatch, tmp_path):
     assert "awaiting_approval" in summary
     assert "S1" in summary
     assert "Add planner tests" in summary
+
+
+def test_cli_uses_approved_plan_as_foreground_execution_context(monkeypatch, tmp_path):
+    _patch_task_root(monkeypatch, tmp_path)
+    inputs = iter(["Implement phase2", "approve", "quit"])
+    monkeypatch.setattr(cli_module, "pt_prompt", lambda *args, **kwargs: next(inputs))
+
+    class ForegroundAgent:
+        def __init__(self):
+            self.llm = FakeLLM(_plan_response())
+            self.prompts = []
+
+        def chat(self, prompt, on_token=None, on_tool=None):
+            self.prompts.append(prompt)
+            return "done"
+
+    planner = Planner(session_id="session-a")
+    planner.enable_plan_mode()
+    agent = ForegroundAgent()
+
+    _repl(agent, Config(model="gpt-5"), planner)
+
+    assert len(agent.prompts) == 1
+    execution_prompt = agent.prompts[0]
+    assert "Approved plan" in execution_prompt
+    assert "Original request:" in execution_prompt
+    assert "Implement phase2" in execution_prompt
+    assert "Add planner tests" in execution_prompt
+    assert "Plan mode behavior is covered." in execution_prompt
+    assert planner.plan_mode_enabled is False
