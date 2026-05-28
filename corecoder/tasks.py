@@ -35,6 +35,7 @@ DEFAULT_BUDGETS = {
     "max_tool_calls": 200,
     "max_minutes": 60,
     "subagent_foreground_seconds": 60,
+    "auto_continue_max_runs": 3,
 }
 
 ALLOWED_TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {

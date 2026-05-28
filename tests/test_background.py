@@ -8,12 +8,35 @@ from corecoder import runner as runner_module
 from corecoder import tasks as tasks_module
 from corecoder.agent import Agent
 from corecoder.background import BackgroundRegistry
-from corecoder.cli import _format_task_summary
+from corecoder.cli import _format_task_summary, _maybe_auto_continue_active_task
 from corecoder.checkpoint import CheckpointStore
 from corecoder.llm import LLMResponse, ToolCall
 from corecoder.runner import TaskRunner
 from corecoder.tasks import TaskStep, TaskStore
 from corecoder.tools.agent import AgentTool
+
+
+class PlannerStub:
+    def __init__(self, store: TaskStore, task_id: str):
+        self.store = store
+        self.active_task_id = task_id
+
+    def active_task(self):
+        return self.store.load(self.active_task_id)
+
+
+class AutoContinueAgent:
+    def __init__(self):
+        self.messages = []
+        self.tools = []
+        self.prompts = []
+
+    def chat(self, prompt, on_token=None, on_tool=None, on_round=None):
+        self.prompts.append(prompt)
+        self.messages.append({"role": "user", "content": prompt})
+        if on_round is not None:
+            on_round({"round": 1, "tool_calls": 0, "done": True})
+        return "auto continued"
 
 
 class FakeLLM:
@@ -246,3 +269,135 @@ def test_task_summary_and_logs_show_background_status(monkeypatch, tmp_path):
     assert "completed pending reconciliation" in summary
     assert handle["transcript_path"] in summary
     assert "summary output" in logs
+
+
+def _create_completed_background(registry: BackgroundRegistry, result: str = "stored result"):
+    def run_subagent():
+        time.sleep(0.05)
+        return result
+
+    registry.run_with_foreground_budget(
+        description="Explore code",
+        prompt="slow background research",
+        foreground_seconds=0.001,
+        run=run_subagent,
+        format_foreground_result=lambda value: value,
+    )
+    return _wait_for(
+        lambda: next(
+            (item for item in registry.list_handles() if item["status"] == "completed"),
+            None,
+        )
+    )
+
+
+def test_cli_auto_continue_consumes_completed_background_before_prompt(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store, budgets={"auto_continue_max_runs": 2})
+    store.update_step(task.id, "S1", "completed", notes="Background result exists.")
+    store.update_step(task.id, "S2", "completed", notes="Ready to finish.")
+    registry = BackgroundRegistry(task.id, root)
+    _create_completed_background(registry, "auto background result")
+    agent = AutoContinueAgent()
+    runner = TaskRunner(agent=agent, store=store)
+    planner = PlannerStub(store, task.id)
+    counts = {}
+
+    ran = _maybe_auto_continue_active_task(planner, runner, counts)
+
+    assert ran is True
+    assert len(agent.prompts) == 1
+    assert "Continue the approved task" in agent.prompts[0]
+    notification_index = next(
+        index
+        for index, message in enumerate(agent.messages)
+        if "<task-notification>" in (message.get("content") or "")
+    )
+    prompt_index = next(
+        index
+        for index, message in enumerate(agent.messages)
+        if message.get("content") == agent.prompts[0]
+    )
+    assert notification_index < prompt_index
+    assert "auto background result" in agent.messages[notification_index]["content"]
+    assert registry.list_handles()[0]["reconciled"] is True
+    assert store.load(task.id).status == "completed"
+    assert counts[task.id] == 1
+
+
+def test_cli_auto_continue_respects_task_budget(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store, budgets={"auto_continue_max_runs": 0})
+    registry = BackgroundRegistry(task.id, root)
+    _create_completed_background(registry, "budgeted result")
+    agent = AutoContinueAgent()
+    runner = TaskRunner(agent=agent, store=store)
+    planner = PlannerStub(store, task.id)
+
+    ran = _maybe_auto_continue_active_task(planner, runner, {})
+
+    assert ran is False
+    assert agent.prompts == []
+    assert registry.list_handles()[0]["reconciled"] is False
+    assert store.load(task.id).status == "running"
+
+
+def test_cli_auto_continue_does_not_wake_paused_task(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store)
+    task = store.update_status(task.id, "paused", last_error="User paused")
+    registry = BackgroundRegistry(task.id, root)
+    _create_completed_background(registry, "paused result")
+    agent = AutoContinueAgent()
+    runner = TaskRunner(agent=agent, store=store)
+    planner = PlannerStub(store, task.id)
+
+    ran = _maybe_auto_continue_active_task(planner, runner, {})
+
+    assert ran is False
+    assert agent.prompts == []
+    assert registry.list_handles()[0]["reconciled"] is False
+    assert store.load(task.id).status == "paused"
+
+
+def test_cli_auto_continue_runs_while_other_background_agent_is_active(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store, budgets={"auto_continue_max_runs": 2})
+    store.update_step(task.id, "S1", "completed", notes="One result exists.")
+    store.update_step(task.id, "S2", "completed", notes="Main agent can choose whether to wait.")
+    registry = BackgroundRegistry(task.id, root)
+    blocker = threading.Event()
+    started = threading.Event()
+
+    def run_blocked_subagent():
+        started.set()
+        blocker.wait(1.0)
+        return "late result"
+
+    registry.run_with_foreground_budget(
+        description="Still running",
+        prompt="slow background research",
+        foreground_seconds=0,
+        run=run_blocked_subagent,
+        format_foreground_result=lambda value: value,
+    )
+    assert started.wait(1.0)
+    completed = _create_completed_background(registry, "ready result")
+    agent = AutoContinueAgent()
+    runner = TaskRunner(agent=agent, store=store)
+    planner = PlannerStub(store, task.id)
+
+    try:
+        ran = _maybe_auto_continue_active_task(planner, runner, {})
+        handles = {handle["id"]: handle for handle in registry.list_handles()}
+
+        assert ran is True
+        assert handles[completed["id"]]["reconciled"] is True
+        assert any(handle["status"] == "backgrounded" for handle in handles.values())
+        assert store.load(task.id).status == "running"
+    finally:
+        blocker.set()

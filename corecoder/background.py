@@ -109,6 +109,13 @@ class BackgroundRegistry:
                 return True
         return False
 
+    def has_unreconciled_completed(self) -> bool:
+        return any(
+            handle.get("status") in PENDING_RECONCILIATION_STATUSES
+            and not handle.get("reconciled")
+            for handle in self.list_handles()
+        )
+
     def reconcile_completed(self) -> list[str]:
         notifications: list[str] = []
         with self._lock:

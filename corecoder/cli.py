@@ -27,7 +27,7 @@ from .config import Config
 from .session import save_session, load_session, list_sessions
 from .planner import PlanError, Planner, build_approved_plan_context
 from .runner import TaskRunner
-from .tasks import TaskState, TaskStatusError
+from .tasks import DEFAULT_BUDGETS, TaskState, TaskStatusError
 from . import __version__
 
 console = Console()
@@ -162,7 +162,11 @@ def _repl(
     def _pause_from_escape(event):
         event.app.exit(result="/pause")
 
+    auto_continue_counts: dict[str, int] = {}
+
     while True:
+        if _maybe_auto_continue_active_task(planner, runner, auto_continue_counts):
+            continue
         try:
             user_input = pt_prompt(
                 "You > ",
@@ -177,6 +181,8 @@ def _repl(
 
         if not user_input:
             continue
+
+        _reset_auto_continue_budget(planner, auto_continue_counts)
 
         # built-in commands
         if user_input.lower() in ("quit", "exit", "/quit", "/exit"):
@@ -347,6 +353,72 @@ def _repl(
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:
             console.print(f"\n[red]Error: {e}[/red]")
+
+
+_AUTO_CONTINUE_PROMPT = (
+    "Continue the approved task using the injected <task-notification> result. "
+    "Decide whether to continue, wait for other background agents, or mark the task blocked."
+)
+
+
+def _maybe_auto_continue_active_task(
+    planner: Planner,
+    runner: TaskRunner,
+    auto_continue_counts: dict[str, int],
+) -> bool:
+    task = planner.active_task()
+    if task is None or task.status != "running":
+        return False
+    if not runner.has_pending_background_notification(task.id):
+        return False
+    limit = task.budgets.get(
+        "auto_continue_max_runs",
+        DEFAULT_BUDGETS["auto_continue_max_runs"],
+    )
+    count = auto_continue_counts.get(task.id, 0)
+    if count >= limit:
+        console.print(
+            f"[yellow]Auto-continue budget reached for task {task.id}; send a message to continue manually.[/yellow]"
+        )
+        return False
+
+    auto_continue_counts[task.id] = count + 1
+    console.print(f"[dim]Background result ready; auto-continuing task {task.id}.[/dim]")
+    streamed: list[str] = []
+
+    def on_token(tok):
+        streamed.append(tok)
+        print(tok, end="", flush=True)
+
+    def on_tool(name, kwargs):
+        console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
+
+    try:
+        with _escape_pause_listener(runner, task.id):
+            response = runner.run(
+                task.id,
+                _AUTO_CONTINUE_PROMPT,
+                on_token=on_token,
+                on_tool=on_tool,
+            )
+        if streamed:
+            print()
+        else:
+            console.print(Markdown(response))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+    return True
+
+
+def _reset_auto_continue_budget(
+    planner: Planner,
+    auto_continue_counts: dict[str, int],
+) -> None:
+    task = planner.active_task()
+    if task is not None:
+        auto_continue_counts[task.id] = 0
 
 
 def _pause_active_task(planner: Planner, runner: TaskRunner) -> TaskState | None:

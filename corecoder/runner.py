@@ -153,6 +153,9 @@ class TaskRunner:
     def background_handles(self, task_id: str) -> list[dict[str, Any]]:
         return BackgroundRegistry(task_id, self.store.root).list_handles()
 
+    def has_pending_background_notification(self, task_id: str) -> bool:
+        return BackgroundRegistry(task_id, self.store.root).has_unreconciled_completed()
+
     def background_logs(self, task_id: str, agent_id: str | None = None) -> str:
         return BackgroundRegistry(task_id, self.store.root).read_logs(agent_id)
 
