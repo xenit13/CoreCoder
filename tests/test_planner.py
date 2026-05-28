@@ -11,6 +11,7 @@ from corecoder.cli import _format_plan_approval, _format_task_summary, _repl
 from corecoder.config import Config
 from corecoder.events import EventLog
 from corecoder.llm import LLMResponse, ToolCall
+from corecoder.plan_files import plan_file_path, read_plan_file
 from corecoder.planner import Planner
 from corecoder.tasks import TaskStatusError, TaskStore
 from corecoder.tools.read import ReadFileTool
@@ -55,7 +56,7 @@ def _plan_response() -> str:
 
 
 def test_generate_plan_creates_awaiting_approval_task_with_readonly_tools(monkeypatch, tmp_path):
-    _patch_task_root(monkeypatch, tmp_path)
+    root = _patch_task_root(monkeypatch, tmp_path)
     llm = FakeLLM(_plan_response())
     planner = Planner(session_id="session-a")
 
@@ -72,6 +73,12 @@ def test_generate_plan_creates_awaiting_approval_task_with_readonly_tools(monkey
     assert planner.active_task_id == task.id
     assert [step.id for step in task.steps] == ["S1", "S2"]
     assert [step.status for step in task.steps] == ["pending", "pending"]
+    plan_path = plan_file_path(task.id, root)
+    assert plan_path.exists()
+    plan_content = read_plan_file(task.id, root)
+    assert "Add plan mode" in plan_content
+    assert "Add planner tests" in plan_content
+    assert "Plan mode behavior is covered." in plan_content
     tool_names = {tool["function"]["name"] for tool in llm.calls[0]["tools"]}
     assert tool_names == {"glob", "grep", "read_file"}
     assert "Do not edit files" in llm.calls[0]["messages"][0]["content"]
@@ -190,7 +197,7 @@ def test_cli_uses_approved_plan_as_foreground_execution_context(monkeypatch, tmp
             self.llm = FakeLLM(_plan_response())
             self.prompts = []
 
-        def chat(self, prompt, on_token=None, on_tool=None):
+        def chat(self, prompt, on_token=None, on_tool=None, on_round=None):
             self.prompts.append(prompt)
             return "done"
 
@@ -203,6 +210,8 @@ def test_cli_uses_approved_plan_as_foreground_execution_context(monkeypatch, tmp
     assert len(agent.prompts) == 1
     execution_prompt = agent.prompts[0]
     assert "Approved plan" in execution_prompt
+    assert "Plan file:" in execution_prompt
+    assert "update_task_progress" in execution_prompt
     assert "Original request:" in execution_prompt
     assert "Implement phase2" in execution_prompt
     assert "Add planner tests" in execution_prompt

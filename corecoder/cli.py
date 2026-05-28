@@ -16,6 +16,7 @@ from .llm import LLM, LiteLLM
 from .config import Config
 from .session import save_session, load_session, list_sessions
 from .planner import PlanError, Planner, build_approved_plan_context
+from .runner import TaskRunner
 from .tasks import TaskState
 from . import __version__
 
@@ -74,6 +75,9 @@ def main():
     )
     agent = Agent(llm=llm, max_context_tokens=config.max_context_tokens)
 
+    planner = Planner(session_id=args.resume or "default")
+    runner = TaskRunner(agent=agent, store=planner.store)
+
     # resume saved session
     if args.resume:
         loaded = load_session(args.resume)
@@ -84,6 +88,10 @@ def main():
                 agent.llm.model = loaded_model
                 config.model = loaded_model
             console.print(f"[green]Resumed session: {args.resume} (model: {agent.llm.model})[/green]")
+            checkpoint = runner.restore_latest_for_session(args.resume)
+            if checkpoint is not None:
+                planner.active_task_id = checkpoint.task_id
+                console.print(f"[green]Restored task checkpoint: {checkpoint.task_id}[/green]")
         else:
             console.print(f"[red]Session '{args.resume}' not found.[/red]")
             sys.exit(1)
@@ -94,7 +102,7 @@ def main():
         return
 
     # interactive REPL
-    _repl(agent, config, Planner(session_id=args.resume or "default"))
+    _repl(agent, config, planner, runner)
 
 
 def _run_once(agent: Agent, prompt: str):
@@ -109,9 +117,15 @@ def _run_once(agent: Agent, prompt: str):
     print()
 
 
-def _repl(agent: Agent, config: Config, planner: Planner | None = None):
+def _repl(
+    agent: Agent,
+    config: Config,
+    planner: Planner | None = None,
+    runner: TaskRunner | None = None,
+):
     """Interactive read-eval-print loop."""
     planner = planner or Planner()
+    runner = runner or TaskRunner(agent=agent, store=planner.store)
     console.print(Panel(
         f"[bold]CoreCoder[/bold] v{__version__}\n"
         f"Model: [cyan]{config.model}[/cyan]"
@@ -229,6 +243,7 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
             continue
 
         execution_input = user_input
+        run_task_id: str | None = None
 
         if planner.plan_mode_enabled:
             try:
@@ -246,7 +261,8 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
             choice = pt_prompt("Plan choice [approve/reject/revise] > ").strip().lower()
             if choice in {"approve", "a", "yes", "y"}:
                 task = planner.approve_plan(task.id)
-                execution_input = build_approved_plan_context(task, user_input)
+                run_task_id = task.id
+                execution_input = build_approved_plan_context(task, user_input, planner.store.root)
                 console.print(f"[green]Plan approved: {task.id}[/green]")
             elif choice in {"reject", "r", "no", "n"}:
                 reason = pt_prompt("Reject reason > ").strip()
@@ -260,6 +276,11 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
                 console.print("[yellow]Unknown choice; plan mode stays enabled.[/yellow]")
                 continue
 
+        if run_task_id is None:
+            active_task = planner.active_task()
+            if active_task is not None and active_task.status in {"running", "paused"}:
+                run_task_id = active_task.id
+
         # call the agent
         streamed: list[str] = []
 
@@ -271,7 +292,15 @@ def _repl(agent: Agent, config: Config, planner: Planner | None = None):
             console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
 
         try:
-            response = agent.chat(execution_input, on_token=on_token, on_tool=on_tool)
+            if run_task_id is not None:
+                response = runner.run(
+                    run_task_id,
+                    execution_input,
+                    on_token=on_token,
+                    on_tool=on_tool,
+                )
+            else:
+                response = agent.chat(execution_input, on_token=on_token, on_tool=on_tool)
             if streamed:
                 print()  # newline after streamed tokens
             else:

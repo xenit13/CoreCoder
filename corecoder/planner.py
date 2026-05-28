@@ -7,6 +7,7 @@ from typing import Any
 
 from .agent import Agent
 from .events import EventLog
+from .plan_files import plan_file_path, read_plan_file, write_plan_file
 from .tasks import TASKS_DIR, TaskState, TaskStep, TaskStore
 from .tools.glob_tool import GlobTool
 from .tools.grep import GrepTool
@@ -63,6 +64,7 @@ class Planner:
             steps=steps,
         )
         task = self.store.update_status(task.id, "awaiting_approval")
+        write_plan_file(task, self.store.root)
         self.active_task_id = task.id
         EventLog(task.id, self.store.root).append(
             "plan_generated",
@@ -120,29 +122,59 @@ def _read_only_plan_tools():
     return [GlobTool(), GrepTool(), ReadFileTool()]
 
 
-def build_approved_plan_context(task: TaskState, user_input: str) -> str:
+def build_approved_plan_context(
+    task: TaskState,
+    user_input: str,
+    root: Path | None = None,
+) -> str:
+    plan_path = plan_file_path(task.id, root)
+    plan_content = read_plan_file(task.id, root) or _fallback_plan_content(task)
+    progress = _format_task_progress(task)
     lines = [
-        "Approved plan is ready for foreground execution.",
+        "<system-reminder>",
+        "User has approved this plan. You can now start coding.",
         "",
         "Original request:",
         user_input,
         "",
-        f"Approved plan for task {task.id}:",
+        "Plan file:",
+        str(plan_path),
+        "",
+        "Approved plan:",
+        plan_content.rstrip(),
+        "",
+        "Current task progress:",
+        progress,
+        "",
+        "Progress tracking:",
+        "Use update_task_progress whenever a plan step status changes.",
+        "Before starting a step, call update_task_progress with status in_progress.",
+        "After satisfying a step's acceptance criteria, mark it completed with notes or evidence.",
+        "If blocked or failed, mark the step blocked or failed with notes.",
+        "Do not claim the task is complete until all required steps are completed or skipped.",
+        "</system-reminder>",
     ]
+    return "\n".join(lines)
+
+
+def _format_task_progress(task: TaskState) -> str:
+    if not task.steps:
+        return "(no plan steps)"
+    return "\n".join(
+        f"- {step.id} [{step.status}] {step.title}" for step in task.steps
+    )
+
+
+def _fallback_plan_content(task: TaskState) -> str:
+    lines = ["# Approved Plan", "", "## Original Request", "", task.user_goal, "", "## Steps", ""]
     for index, step in enumerate(task.steps, start=1):
-        lines.append(f"{index}. {step.title}")
+        lines.append(f"{index}. {step.id} - {step.title}")
         if step.acceptance:
             lines.append(f"   Acceptance: {step.acceptance}")
         if step.depends_on:
             lines.append(f"   Depends on: {', '.join(step.depends_on)}")
-    lines.extend(
-        [
-            "",
-            "Use this approved plan as execution context.",
-            "Continue in the normal foreground agent loop and use the plan to guide the work.",
-        ]
-    )
-    return "\n".join(lines)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _plan_system_prompt() -> str:

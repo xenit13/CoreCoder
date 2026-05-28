@@ -45,12 +45,12 @@ class Agent:
     def _tool_schemas(self) -> list[dict]:
         return [t.schema() for t in self.tools]
 
-    def chat(self, user_input: str, on_token=None, on_tool=None) -> str:
+    def chat(self, user_input: str, on_token=None, on_tool=None, on_round=None) -> str:
         """Process one user message. May involve multiple LLM/tool rounds."""
         self.messages.append({"role": "user", "content": user_input})
         self.context.maybe_compress(self.messages, self.llm)
 
-        for _ in range(self.max_rounds):
+        for round_index in range(1, self.max_rounds + 1):
             resp = self.llm.chat(
                 messages=self._full_messages(),
                 tools=self._tool_schemas(),
@@ -60,6 +60,8 @@ class Agent:
             # no tool calls -> LLM is done, return text
             if not resp.tool_calls:
                 self.messages.append(resp.message)
+                if on_round:
+                    on_round({"round": round_index, "tool_calls": 0, "done": True})
                 return resp.content
 
             # tool calls -> execute (parallel when multiple, like Claude Code's
@@ -88,6 +90,12 @@ class Agent:
 
             # compress if tool outputs are big
             self.context.maybe_compress(self.messages, self.llm)
+            if on_round:
+                on_round({
+                    "round": round_index,
+                    "tool_calls": len(resp.tool_calls),
+                    "done": False,
+                })
 
         return "(reached maximum tool-call rounds)"
 
