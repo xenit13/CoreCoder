@@ -253,6 +253,58 @@ def test_runner_marks_task_failed_when_agent_raises(monkeypatch, tmp_path):
     assert "task_failed" in events
 
 
+def test_runner_pause_updates_task_event_and_checkpoint(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store)
+    agent = Agent(llm=FakeLLM([]), tools=[EchoTool()])
+    runner = TaskRunner(agent=agent, store=store)
+
+    paused = runner.pause(task.id, reason="User requested pause")
+
+    assert paused.status == "paused"
+    assert paused.last_error == "User requested pause"
+    checkpoint = CheckpointStore(root).load(task.id)
+    assert checkpoint.task.status == "paused"
+    events = [event["type"] for event in EventLog(task.id, root).read()]
+    assert "task_paused" in events
+
+
+def test_runner_cancel_updates_task_event_and_checkpoint(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore(root)
+    task = _running_task(store)
+    agent = Agent(llm=FakeLLM([]), tools=[EchoTool()])
+    runner = TaskRunner(agent=agent, store=store)
+
+    cancelled = runner.cancel(task.id, reason="User requested cancel")
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.last_error == "User requested cancel"
+    checkpoint = CheckpointStore(root).load(task.id)
+    assert checkpoint.task.status == "cancelled"
+    events = [event["type"] for event in EventLog(task.id, root).read()]
+    assert "task_cancelled" in events
+
+
+def test_runner_refuses_cancelled_task(monkeypatch, tmp_path):
+    _patch_task_root(monkeypatch, tmp_path)
+    store = TaskStore()
+    task = _running_task(store)
+    agent = Agent(llm=FakeLLM([LLMResponse(content="should not run")]), tools=[EchoTool()])
+    runner = TaskRunner(agent=agent, store=store)
+    runner.cancel(task.id, reason="User requested cancel")
+
+    try:
+        runner.run(task.id, "Approved plan context")
+    except tasks_module.TaskStatusError as exc:
+        assert "cancelled" in str(exc)
+    else:
+        raise AssertionError("expected cancelled task to be refused")
+
+    assert not agent.messages
+
+
 def test_runner_restores_latest_checkpoint_for_session(monkeypatch, tmp_path):
     root = _patch_task_root(monkeypatch, tmp_path)
     store = TaskStore(root)

@@ -14,6 +14,14 @@ class TaskBudgetExceeded(RuntimeError):
     """Raised when a foreground task exceeds its configured budget."""
 
 
+class TaskPaused(RuntimeError):
+    """Raised when a foreground task is cooperatively paused."""
+
+
+class TaskCancelled(RuntimeError):
+    """Raised when a foreground task is cooperatively cancelled."""
+
+
 class TaskRunner:
     """Run approved tasks through the normal foreground Agent loop."""
 
@@ -46,6 +54,7 @@ class TaskRunner:
             counters["rounds"] = int(info.get("round", counters["rounds"] + 1))
             counters["tool_calls"] += int(info.get("tool_calls", 0))
             self._save_checkpoint(task.id, counters, events)
+            self._raise_if_controlled(task.id, counters, events)
             self._enforce_budgets(task.id, counters, started_at)
             if (
                 not info.get("done")
@@ -74,8 +83,12 @@ class TaskRunner:
             return self._finalize_after_agent_return(task.id, response, counters, events)
         except TaskBudgetExceeded as exc:
             return self._block_task(task.id, str(exc), counters, events)
+        except TaskPaused as exc:
+            return f"Task paused: {exc}"
+        except TaskCancelled as exc:
+            return f"Task cancelled: {exc}"
         except KeyboardInterrupt:
-            self._pause_task(task.id, counters, events)
+            self._pause_task(task.id, counters, events, reason="Interrupted")
             raise
         except Exception as exc:
             self._fail_task(task.id, str(exc), counters, events)
@@ -101,6 +114,24 @@ class TaskRunner:
                 return checkpoint
         return None
 
+    def pause(self, task_id: str, *, reason: str = "User requested pause") -> TaskState:
+        events = EventLog(task_id, self.store.root)
+        return self._pause_task(
+            task_id,
+            {"rounds": 0, "tool_calls": 0},
+            events,
+            reason=reason,
+        )
+
+    def cancel(self, task_id: str, *, reason: str = "User requested cancel") -> TaskState:
+        events = EventLog(task_id, self.store.root)
+        return self._cancel_task(
+            task_id,
+            {"rounds": 0, "tool_calls": 0},
+            events,
+            reason=reason,
+        )
+
     def _prepare_running_task(self, task_id: str) -> TaskState:
         task = self.store.load(task_id)
         if task is None:
@@ -124,6 +155,9 @@ class TaskRunner:
         if task.status in {"failed", "cancelled"}:
             self._save_checkpoint(task.id, counters, events)
             return response
+        if task.status == "paused":
+            self._save_checkpoint(task.id, counters, events)
+            return f"Task paused: {task.last_error or 'Task paused'}"
         failed_step = next((step for step in task.steps if step.status == "failed"), None)
         if failed_step:
             self._fail_task(
@@ -175,10 +209,42 @@ class TaskRunner:
         task_id: str,
         counters: dict[str, int],
         events: EventLog,
-    ) -> None:
-        task = self.store.update_status(task_id, "paused", last_error="Interrupted")
-        events.append("task_paused", task_id=task.id, reason="Interrupted")
+        *,
+        reason: str,
+    ) -> TaskState:
+        task = self.store.load(task_id)
+        if task is None:
+            raise FileNotFoundError(f"Task not found: {task_id}")
+        if task.status == "paused":
+            self._save_checkpoint(task.id, counters, events)
+            return task
+        if task.status != "running":
+            raise TaskStatusError(f"Task must be running to pause: {task.status}")
+        task = self.store.update_status(task_id, "paused", last_error=reason)
+        events.append("task_paused", task_id=task.id, reason=reason)
         self._save_checkpoint(task.id, counters, events)
+        return task
+
+    def _cancel_task(
+        self,
+        task_id: str,
+        counters: dict[str, int],
+        events: EventLog,
+        *,
+        reason: str,
+    ) -> TaskState:
+        task = self.store.load(task_id)
+        if task is None:
+            raise FileNotFoundError(f"Task not found: {task_id}")
+        if task.status == "cancelled":
+            self._save_checkpoint(task.id, counters, events)
+            return task
+        if task.status in {"completed", "failed"}:
+            raise TaskStatusError(f"Terminal task cannot be cancelled: {task.status}")
+        task = self.store.update_status(task_id, "cancelled", last_error=reason)
+        events.append("task_cancelled", task_id=task.id, reason=reason)
+        self._save_checkpoint(task.id, counters, events)
+        return task
 
     def _fail_task(
         self,
@@ -190,6 +256,22 @@ class TaskRunner:
         task = self.store.update_status(task_id, "failed", last_error=reason)
         events.append("task_failed", task_id=task.id, reason=reason)
         self._save_checkpoint(task.id, counters, events)
+
+    def _raise_if_controlled(
+        self,
+        task_id: str,
+        counters: dict[str, int],
+        events: EventLog,
+    ) -> None:
+        task = self.store.load(task_id)
+        if task is None:
+            raise FileNotFoundError(f"Task not found: {task_id}")
+        if task.status == "paused":
+            self._save_checkpoint(task.id, counters, events)
+            raise TaskPaused(task.last_error or "Task paused")
+        if task.status == "cancelled":
+            self._save_checkpoint(task.id, counters, events)
+            raise TaskCancelled(task.last_error or "Task cancelled")
 
     def _enforce_budgets(
         self,

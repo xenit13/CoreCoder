@@ -9,6 +9,7 @@ from corecoder import planner as planner_module
 from corecoder import tasks as tasks_module
 from corecoder.cli import _format_plan_approval, _format_task_summary, _repl
 from corecoder.config import Config
+from corecoder.checkpoint import CheckpointStore
 from corecoder.events import EventLog
 from corecoder.llm import LLMResponse, ToolCall
 from corecoder.plan_files import plan_file_path, read_plan_file
@@ -185,6 +186,41 @@ def test_cli_formats_active_task_and_plan_choices(monkeypatch, tmp_path):
     assert "awaiting_approval" in summary
     assert "S1" in summary
     assert "Add planner tests" in summary
+
+
+def test_cli_pause_and_cancel_control_active_task(monkeypatch, tmp_path):
+    root = _patch_task_root(monkeypatch, tmp_path)
+    inputs = iter(["/pause", "/cancel", "quit"])
+    monkeypatch.setattr(cli_module, "pt_prompt", lambda *args, **kwargs: next(inputs))
+
+    class IdleAgent:
+        def __init__(self):
+            self.llm = FakeLLM(_plan_response())
+            self.messages = []
+            self.tools = []
+
+    planner = Planner(session_id="session-a")
+    task = planner.store.create_task(
+        session_id="session-a",
+        user_goal="Pause and cancel task",
+        model="gpt-5",
+        cwd="/data/CoreCoder",
+        task_id="control-task",
+    )
+    planner.store.update_status(task.id, "awaiting_approval")
+    task = planner.store.update_status(task.id, "running")
+    planner.active_task_id = task.id
+
+    _repl(IdleAgent(), Config(model="gpt-5"), planner)
+
+    reloaded = planner.store.load(task.id)
+    assert reloaded.status == "cancelled"
+    assert reloaded.last_error == "User requested cancel"
+    checkpoint = CheckpointStore(root).load(task.id)
+    assert checkpoint.task.status == "cancelled"
+    events = [event["type"] for event in EventLog(task.id, root).read()]
+    assert "task_paused" in events
+    assert "task_cancelled" in events
 
 
 def test_cli_uses_approved_plan_as_foreground_execution_context(monkeypatch, tmp_path):

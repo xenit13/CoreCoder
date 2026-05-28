@@ -3,6 +3,16 @@
 import sys
 import os
 import argparse
+import contextlib
+import select
+import threading
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows fallback
+    termios = None
+    tty = None
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -17,7 +27,7 @@ from .config import Config
 from .session import save_session, load_session, list_sessions
 from .planner import PlanError, Planner, build_approved_plan_context
 from .runner import TaskRunner
-from .tasks import TaskState
+from .tasks import TaskState, TaskStatusError
 from . import __version__
 
 console = Console()
@@ -130,7 +140,7 @@ def _repl(
         f"[bold]CoreCoder[/bold] v{__version__}\n"
         f"Model: [cyan]{config.model}[/cyan]"
         + (f"  Base: [dim]{config.base_url}[/dim]" if config.base_url else "")
-        + "\nType [bold]/help[/bold] for commands, [bold]Ctrl+C[/bold] to cancel, [bold]quit[/bold] to exit.",
+        + "\nType [bold]/help[/bold] for commands, [bold]Ctrl+C[/bold] or [bold]Esc[/bold] to pause, [bold]/cancel[/bold] to cancel.",
         border_style="blue",
     ))
 
@@ -147,6 +157,10 @@ def _repl(
     @kb.add("escape", "enter")
     def _newline(event):
         event.current_buffer.insert_text("\n")
+
+    @kb.add("escape")
+    def _pause_from_escape(event):
+        event.app.exit(result="/pause")
 
     while True:
         try:
@@ -173,6 +187,12 @@ def _repl(
         if user_input == "/plan_mode":
             planner.enable_plan_mode()
             console.print("[cyan]Plan mode enabled for the next request.[/cyan]")
+            continue
+        if user_input == "/pause":
+            _pause_active_task(planner, runner)
+            continue
+        if user_input == "/cancel":
+            _cancel_active_task(planner, runner)
             continue
         if user_input == "/task":
             task = planner.active_task()
@@ -293,12 +313,13 @@ def _repl(
 
         try:
             if run_task_id is not None:
-                response = runner.run(
-                    run_task_id,
-                    execution_input,
-                    on_token=on_token,
-                    on_tool=on_tool,
-                )
+                with _escape_pause_listener(runner, run_task_id):
+                    response = runner.run(
+                        run_task_id,
+                        execution_input,
+                        on_token=on_token,
+                        on_tool=on_tool,
+                    )
             else:
                 response = agent.chat(execution_input, on_token=on_token, on_tool=on_tool)
             if streamed:
@@ -312,10 +333,103 @@ def _repl(
             console.print(f"\n[red]Error: {e}[/red]")
 
 
+def _pause_active_task(planner: Planner, runner: TaskRunner) -> TaskState | None:
+    task = planner.active_task()
+    if task is None:
+        console.print("[dim]No active task.[/dim]")
+        return None
+    if task.status == "paused":
+        console.print(f"[yellow]Task already paused: {task.id}[/yellow]")
+        return task
+    try:
+        task = runner.pause(task.id, reason="User requested pause")
+    except TaskStatusError as exc:
+        console.print(f"[yellow]Cannot pause task: {exc}[/yellow]")
+        return None
+    planner.active_task_id = task.id
+    console.print(f"[yellow]Task paused: {task.id}[/yellow]")
+    return task
+
+
+def _cancel_active_task(planner: Planner, runner: TaskRunner) -> TaskState | None:
+    task = planner.active_task()
+    if task is None:
+        console.print("[dim]No active task.[/dim]")
+        return None
+    if task.status == "cancelled":
+        console.print(f"[yellow]Task already cancelled: {task.id}[/yellow]")
+        return task
+    try:
+        task = runner.cancel(task.id, reason="User requested cancel")
+    except TaskStatusError as exc:
+        console.print(f"[yellow]Cannot cancel task: {exc}[/yellow]")
+        return None
+    planner.active_task_id = task.id
+    console.print(f"[yellow]Task cancelled: {task.id}[/yellow]")
+    return task
+
+
+@contextlib.contextmanager
+def _escape_pause_listener(runner: TaskRunner, task_id: str):
+    if termios is None or tty is None or not _stdin_is_tty():
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    try:
+        previous_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except (OSError, termios.error):
+        yield
+        return
+
+    stop = threading.Event()
+
+    def watch_escape() -> None:
+        while not stop.is_set():
+            try:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            except (OSError, ValueError):
+                return
+            if not readable:
+                continue
+            try:
+                char = sys.stdin.read(1)
+            except (OSError, ValueError):
+                return
+            if char == "\x1b":
+                try:
+                    runner.pause(task_id, reason="User pressed Esc")
+                except Exception:
+                    pass
+                return
+
+    thread = threading.Thread(target=watch_escape, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous_attrs)
+        except (OSError, termios.error):
+            pass
+        thread.join(timeout=0.2)
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError):
+        return False
+
+
 def _show_help():
     console.print(Panel(
         "[bold]Commands:[/bold]\n"
         "  /help          Show this help\n"
+        "  /pause         Pause the active running task\n"
+        "  /cancel        Cancel the active task\n"
         "  /reset         Clear conversation history\n"
         "  /model         Show current model\n"
         "  /model <name>  Switch model mid-conversation\n"
@@ -328,6 +442,7 @@ def _show_help():
         "\n"
         "[bold]Input:[/bold]\n"
         "  Enter          Submit message\n"
+        "  Esc            Pause the active running task\n"
         "  Esc+Enter      Insert newline (for pasting code)",
         title="CoreCoder Help",
         border_style="dim",
