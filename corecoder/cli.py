@@ -523,24 +523,32 @@ def _stdin_is_tty() -> bool:
 
 def _show_help():
     console.print(Panel(
-        "[bold]Commands:[/bold]\n"
-        "  /help          Show this help\n"
-        "  /pause         Pause the active running task\n"
-        "  /cancel        Cancel the active task\n"
-        "  /reset         Clear conversation history\n"
-        "  /model         Show current model\n"
-        "  /model <name>  Switch model mid-conversation\n"
-        "  /tokens        Show token usage\n"
-        "  /compact       Compress conversation context\n"
-        "  /diff          Show files modified this session\n"
-        "  /save          Save session to disk\n"
-        "  /sessions      List saved sessions\n"
-        "  quit           Exit CoreCoder\n"
+        "[bold]Conversation:[/bold]\n"
+        "  /help              Show this help\n"
+        "  /reset             Clear conversation history\n"
+        "  /compact           Compress conversation context\n"
+        "  /save              Save session to disk\n"
+        "  /sessions          List saved sessions\n"
+        "  /diff              Show files modified this session\n"
+        "  quit, exit         Exit CoreCoder\n"
+        "\n"
+        "[bold]Model:[/bold]\n"
+        "  /model             Show current model\n"
+        "  /model <name>      Switch model mid-conversation\n"
+        "  /tokens            Show token usage and estimated cost\n"
+        "\n"
+        "[bold]Tasks:[/bold]\n"
+        "  /plan_mode         Plan the next request before executing it\n"
+        "  /task              Show the active task\n"
+        "  /tasks             List recent tasks\n"
+        "  /logs \\[agent_id]   Show active task background-agent logs\n"
+        "  /pause             Pause the active running task\n"
+        "  /cancel            Cancel the active task\n"
         "\n"
         "[bold]Input:[/bold]\n"
-        "  Enter          Submit message\n"
-        "  Esc            Pause the active running task\n"
-        "  Esc+Enter      Insert newline (for pasting code)",
+        "  Enter              Submit message\n"
+        "  Esc                Pause the active running task\n"
+        "  Esc+Enter          Insert newline (for pasting code)",
         title="CoreCoder Help",
         border_style="dim",
     ))
